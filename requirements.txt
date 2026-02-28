@@ -1,0 +1,16 @@
+# ── Telegram MTProto client ───────────────────────────────────────────────────
+# IMPORTANT: Use pyrofork, NOT pyrogram.
+# py-tgcalls requires GroupcallForbidden from pyrogram.errors which only
+# exists in pyrofork (the maintained fork). Using plain pyrogram will crash.
+pyrofork==2.2.10
+tgcrypto
+
+# ── Voice call engine ─────────────────────────────────────────────────────────
+py-tgcalls==0.9.4
+
+# ── Telegram Bot API ──────────────────────────────────────────────────────────
+python-telegram-bot[all]>=20.0,<22.0
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+psutil>=5.9.0
