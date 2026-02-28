@@ -1,16 +1,19 @@
-# ── Telegram MTProto client ───────────────────────────────────────────────────
+# ── Telegram MTProto client ────────────────────────────────────────────────────
 # IMPORTANT: Use pyrofork, NOT pyrogram.
 # py-tgcalls requires GroupcallForbidden from pyrogram.errors which only
-# exists in pyrofork (the maintained fork). Using plain pyrogram will crash.
+# exists in pyrofork (the maintained fork). Using plain pyrogram WILL crash.
 pyrofork==2.2.10
 tgcrypto
 
-# ── Voice call engine ─────────────────────────────────────────────────────────
-py-tgcalls==0.9.4
+# ── Voice call engine ──────────────────────────────────────────────────────────
+# IMPORTANT: Use 1.2.9, NOT 2.x.
+# py-tgcalls 2.x has a completely different API (mute_call/unmute_call removed).
+# 1.2.9 is the last stable version compatible with the current voice_chat_handler.
+py-tgcalls==1.2.9
 
-# ── Telegram Bot API ──────────────────────────────────────────────────────────
+# ── Telegram Bot API ───────────────────────────────────────────────────────────
 python-telegram-bot[all]>=20.0,<22.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 psutil>=5.9.0
