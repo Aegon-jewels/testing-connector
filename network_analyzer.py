@@ -2,20 +2,26 @@
 network_analyzer.py
 ────────────────────────────────────────────────────────────────────
 Network monitoring using psutil and packet capture (tcpdump/tshark).
-Full IPv4 + IPv6 support:
-  • TELEGRAM_DCS includes IPv6 DC addresses
-  • psutil captures both IPv4 and IPv6 connections (kind='all')
-  • STUN extraction handles both stun.att.ipv4.xord and stun.att.ipv6.xord
-  • pcap STUN tshark command uses pipe separator and ipv6 fields
+Works on Windows (tshark) and Linux (tcpdump).
+CCNA concepts covered:
+  ✅ TCP vs UDP traffic distribution
+  ✅ TCP connection states
+  ✅ Port-to-protocol mapping
+  ✅ Bandwidth calculation (Kbps)
+  ✅ Packets per second (PPS)
+  ✅ Telegram Data Center IP detection (IPv4 + IPv6)
+  ✅ Connection delta tracking
+  ✅ Peak bandwidth & average PPS
+  ✅ Packet error and drop counters
 """
 
+import json
 import time
 import psutil
 import subprocess
 import os
 import sys
 import platform
-import json
 from collections import Counter
 from datetime import datetime
 
@@ -27,7 +33,7 @@ TELEGRAM_DCS: dict[str, str] = {
     "149.154.175.53":   "DC1 🇺🇸 US-Virginia",
     "149.154.167.40":   "DC2 🇳🇱 Netherlands",
     "149.154.167.41":   "DC2 🇳🇱 Netherlands",
-    "149.154.167.51":   "DC2 🇳🇱 Netherlands",
+    "149.154.167.51":   "DC2 🇳🇱 Netherlands",   # most common
     "149.154.175.100":  "DC3 🇺🇸 US-Miami",
     "149.154.167.91":   "DC4 🇳🇱 Netherlands",
     "149.154.167.92":   "DC4 🇳🇱 Netherlands",
@@ -53,19 +59,24 @@ TELEGRAM_DCS: dict[str, str] = {
 # ─── Well-known port → protocol name ─────────────────────────────────────────
 PORT_PROTOCOLS: dict[int, str] = {
     80:    "HTTP",
-    443:   "HTTPS/TLS",
+    443:   "HTTPS/TLS",       # MTProto rides over this
     8080:  "HTTP-Alt",
     8443:  "HTTPS-Alt",
     53:    "DNS",
     853:   "DNS-over-TLS",
-    3478:  "STUN",
+    3478:  "STUN",            # standard NAT traversal
     3479:  "STUN-Alt",
+    1400:  "STUN-Telegram",   # Telegram-specific STUN port
     5349:  "TURNS",
     19302: "STUN-Google",
     5222:  "MTProto-Proxy",
     1080:  "SOCKS5",
     22:    "SSH",
     21:    "FTP",
+    596:   "TG-Voice",        # Telegram encrypted voice media
+    597:   "TG-Voice",
+    598:   "TG-Voice",
+    599:   "TG-Voice",
 }
 
 # ─── TCP state plain-English descriptions ────────────────────────────────────
@@ -84,6 +95,7 @@ STATE_DESCRIPTIONS: dict[str, str] = {
 
 
 def identify_port(port: int) -> str:
+    """Map port number to protocol name."""
     if port in PORT_PROTOCOLS:
         return PORT_PROTOCOLS[port]
     if port >= 49152:
@@ -94,7 +106,7 @@ def identify_port(port: int) -> str:
 
 
 def _strip_zone(ip: str) -> str:
-    """Remove IPv6 zone ID suffix (e.g. fe80::1%eth0 → fe80::1)."""
+    """Strip IPv6 zone ID suffix (e.g. fe80::1%eth0 → fe80::1)."""
     return ip.split("%")[0] if ip else ip
 
 
@@ -107,39 +119,45 @@ class PacketCapture:
         self.process     = None
 
     def _find_interface(self):
+        """Pick first non‑loopback interface."""
         for iface, stats in psutil.net_if_stats().items():
             if stats.isup and not iface.startswith(("lo", "Loopback")):
-                return iface
-        for iface in ["eth0", "ens3", "ens5", "enp0s3"]:
-            if iface in psutil.net_if_stats():
                 return iface
         return "eth0"
 
     def start(self):
+        """Start capture process. Returns True if successful."""
         if platform.system() == "Windows":
-            cmd    = ["tshark", "-i", self._find_interface(),
-                      "-f", "udp", "-w", self.output_file, "-F", "pcapng"]
+            cmd = [
+                "tshark", "-i", self._find_interface(),
+                "-f", "udp",
+                "-w", self.output_file,
+                "-F", "pcapng"
+            ]
             kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
         else:
-            # Capture both IPv4 and IPv6 UDP traffic
-            cmd    = ["sudo", "tcpdump", "-i", self._find_interface(),
-                      "-U", "-w", self.output_file, "-s", "0",
-                      "udp or (ip6 and udp)"]
+            # Capture all UDP including IPv6; no port filter so we get all voice traffic
+            cmd = [
+                "sudo", "tcpdump", "-i", self._find_interface(),
+                "-U", "-w", self.output_file,
+                "-s", "0",
+                "udp or (ip6 and udp)"
+            ]
             kwargs = {}
         try:
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                **kwargs,
+                **kwargs
             )
             return True
         except FileNotFoundError:
             tool = "tshark" if platform.system() == "Windows" else "tcpdump"
-            print(f"⚠️  {tool} not found. Install it and ensure it's in PATH.")
+            print(f"⚠️ {tool} not found. Install it and ensure it's in PATH.")
             return False
         except PermissionError:
-            print("⚠️  Permission denied. Run with sudo (Linux) or as administrator (Windows).")
+            print("⚠️ Permission denied. Run with sudo (Linux) or as administrator (Windows).")
             return False
 
     def stop(self):
@@ -153,12 +171,12 @@ class PacketCapture:
 
 class NetworkCapture:
     """
-    Captures and analyses network activity using psutil + optional packet capture.
-    Supports both IPv4 and IPv6.
+    Captures and analyses network activity using psutil and optional packet capture.
+    IPv4 + IPv6 aware.
     """
 
     def __init__(self, duration: int = 60, capture_packets: bool = True):
-        self.duration       = duration
+        self.duration        = duration
         self.capture_packets = capture_packets
         self.start_time: float | None = None
         self.is_running: bool         = False
@@ -177,28 +195,28 @@ class NetworkCapture:
 
         self.packet_capture = None
         if capture_packets:
-            timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-            pcap_file  = f"capture_{timestamp}.pcap"
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pcap_file = f"capture_{timestamp}.pcap"
             self.packet_capture = PacketCapture(output_file=pcap_file)
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+    # ── Internal helpers ───────────────────────────────────────────────────────────
 
     def _read_connections(self) -> list[dict]:
         result = []
         try:
-            # kind='all' → IPv4 TCP, IPv4 UDP, IPv6 TCP, IPv6 UDP
+            # kind='all' captures IPv4 TCP/UDP AND IPv6 TCP/UDP
             conns = psutil.net_connections(kind="all")
         except Exception:
             return result
 
         for c in conns:
             try:
-                proto     = "TCP" if c.type == 1 else "UDP"
-                remote_ip = _strip_zone(c.raddr.ip)   if c.raddr else ""
-                remote_pt = c.raddr.port               if c.raddr else 0
-                local_ip  = _strip_zone(c.laddr.ip)   if c.laddr else ""
-                local_pt  = c.laddr.port               if c.laddr else 0
-                status    = (getattr(c, "status", "") or "").strip() or "NONE"
+                proto      = "TCP" if c.type == 1 else "UDP"
+                remote_ip  = _strip_zone(c.raddr.ip)   if c.raddr else ""
+                remote_pt  = c.raddr.port               if c.raddr else 0
+                local_ip   = _strip_zone(c.laddr.ip)   if c.laddr else ""
+                local_pt   = c.laddr.port               if c.laddr else 0
+                status     = (getattr(c, "status", "") or "").strip() or "NONE"
 
                 if not remote_ip:
                     continue
@@ -221,9 +239,9 @@ class NetworkCapture:
                 }
                 result.append(conn)
 
-                self.protocol_counter[proto]       += 1
-                self.connection_states[status]     += 1
-                self.port_protocols[port_proto]    += 1
+                self.protocol_counter[proto]    += 1
+                self.connection_states[status]  += 1
+                self.port_protocols[port_proto] += 1
 
                 if is_tg:
                     self.dc_connections[remote_ip] = TELEGRAM_DCS[remote_ip]
@@ -270,13 +288,19 @@ class NetworkCapture:
         })
         return snap
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────────
 
     def log_event(self, event_name: str, details: str = ""):
-        self.events.append({"timestamp": time.time(), "event": event_name, "details": details})
+        """Log a significant event and immediately take a snapshot."""
+        self.events.append({
+            "timestamp": time.time(),
+            "event":     event_name,
+            "details":   details,
+        })
         self._take_snapshot(event_type=event_name)
 
     def start_capture(self):
+        """Blocking capture loop — run via executor (thread)."""
         self.start_time     = time.time()
         self.is_running     = True
         self.initial_net_io = psutil.net_io_counters()
@@ -325,79 +349,6 @@ class NetworkCapture:
             return self.packet_capture.output_file
         return None
 
-    def _analyze_pcap(self) -> dict:
-        """Run tshark on the captured pcap — extracts STUN (IPv4+IPv6) and RTP."""
-        if not self.packet_capture or not os.path.exists(self.packet_capture.output_file):
-            return {}
-
-        pcap   = self.packet_capture.output_file
-        result = {}
-
-        # ── 1. UDP conversations ──────────────────────────────────────────────
-        try:
-            out = subprocess.check_output(
-                ["tshark", "-r", pcap, "-q", "-z", "conv,udp"],
-                stderr=subprocess.DEVNULL, text=True
-            )
-            result["udp_conversations"] = out
-        except Exception:
-            result["udp_conversations"] = "Could not extract UDP conversations."
-
-        # ── 2. STUN packets — both IPv4 and IPv6 fields ───────────────────────
-        # Use pipe separator so IPv6 colons don't break parsing
-        cmd = [
-            "tshark", "-r", pcap,
-            "-Y", "stun",
-            "-T", "fields",
-            "-E", "separator=|",
-            "-e", "ip.src",                # IPv4 source      (empty for IPv6 pkt)
-            "-e", "ip.dst",                # IPv4 destination (empty for IPv6 pkt)
-            "-e", "ipv6.src",              # IPv6 source      (empty for IPv4 pkt)
-            "-e", "ipv6.dst",              # IPv6 destination (empty for IPv4 pkt)
-            "-e", "udp.srcport",
-            "-e", "udp.dstport",
-            "-e", "stun.att.ipv4.xord",   # XOR-MAPPED-ADDRESS (IPv4)
-            "-e", "stun.att.ipv6.xord",   # XOR-MAPPED-ADDRESS (IPv6)
-        ]
-        try:
-            out   = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
-            lines = out.strip().split("\n")
-            stun_entries = []
-            for line in lines:
-                if not line.strip():
-                    continue
-                p = line.split("|")
-                if len(p) < 8:
-                    continue
-                # Prefer IPv6 addresses when present
-                src_ip   = p[2].strip() if p[2].strip() else p[0].strip()
-                dst_ip   = p[3].strip() if p[3].strip() else p[1].strip()
-                xored_ip = p[7].strip() if p[7].strip() else (p[6].strip() or "N/A")
-                ip_ver   = "IPv6" if ":" in src_ip else "IPv4"
-                stun_entries.append({
-                    "ip_version": ip_ver,
-                    "src_ip":     src_ip,
-                    "dst_ip":     dst_ip,
-                    "src_port":   p[4].strip(),
-                    "dst_port":   p[5].strip(),
-                    "xored_ip":   xored_ip,
-                })
-            result["stun_packets"] = stun_entries
-        except Exception:
-            result["stun_packets"] = []
-
-        # ── 3. RTP streams ───────────────────────────────────────────────────
-        try:
-            out = subprocess.check_output(
-                ["tshark", "-r", pcap, "-q", "-z", "rtp,streams"],
-                stderr=subprocess.DEVNULL, text=True
-            )
-            result["rtp_streams"] = out
-        except Exception:
-            result["rtp_streams"] = "No RTP streams detected or could not parse."
-
-        return result
-
     def get_report(self) -> dict:
         if not self.start_time:
             return {"error": "Capture never started"}
@@ -405,22 +356,23 @@ class NetworkCapture:
         elapsed = time.time() - self.start_time
 
         if self.initial_net_io and self.final_net_io:
-            b_sent = self.final_net_io.bytes_sent   - self.initial_net_io.bytes_sent
-            b_recv = self.final_net_io.bytes_recv   - self.initial_net_io.bytes_recv
-            p_sent = self.final_net_io.packets_sent - self.initial_net_io.packets_sent
-            p_recv = self.final_net_io.packets_recv - self.initial_net_io.packets_recv
-            errin  = self.final_net_io.errin  - self.initial_net_io.errin
-            errout = self.final_net_io.errout - self.initial_net_io.errout
-            dropin = self.final_net_io.dropin - self.initial_net_io.dropin
-            avg_bw = (b_sent + b_recv) * 8 / elapsed / 1000 if elapsed else 0
+            b_sent  = self.final_net_io.bytes_sent   - self.initial_net_io.bytes_sent
+            b_recv  = self.final_net_io.bytes_recv   - self.initial_net_io.bytes_recv
+            p_sent  = self.final_net_io.packets_sent - self.initial_net_io.packets_sent
+            p_recv  = self.final_net_io.packets_recv - self.initial_net_io.packets_recv
+            errin   = self.final_net_io.errin  - self.initial_net_io.errin
+            errout  = self.final_net_io.errout - self.initial_net_io.errout
+            dropin  = self.final_net_io.dropin - self.initial_net_io.dropin
+            avg_bw  = (b_sent + b_recv) * 8 / elapsed / 1000 if elapsed else 0
         else:
-            b_sent = b_recv = p_sent = p_recv = errin = errout = dropin = avg_bw = 0
+            b_sent = b_recv = p_sent = p_recv = 0
+            errin = errout = dropin = avg_bw = 0
 
-        series  = self._bandwidth_series()
-        peak_up = max((s["kbps_up"] for s in series), default=0)
-        peak_dn = max((s["kbps_dn"] for s in series), default=0)
-        avg_pps = (sum(s["pps_up"] + s["pps_dn"] for s in series) / len(series)
-                   if series else 0)
+        series   = self._bandwidth_series()
+        peak_up  = max((s["kbps_up"] for s in series), default=0)
+        peak_dn  = max((s["kbps_dn"] for s in series), default=0)
+        avg_pps  = (sum(s["pps_up"] + s["pps_dn"] for s in series) / len(series)
+                    if series else 0)
 
         all_new, all_dropped = [], []
         unique = set()
@@ -430,35 +382,32 @@ class NetworkCapture:
             all_new.extend(snap.get("new_connections", []))
             all_dropped.extend(snap.get("dropped_connections", []))
 
-        pcap_analysis = self._analyze_pcap()
-
         return {
-            "duration":            elapsed,
-            "start_time":          self.start_time,
-            "bytes_sent":          b_sent,
-            "bytes_recv":          b_recv,
-            "total_bytes":         b_sent + b_recv,
-            "packets_sent":        p_sent,
-            "packets_recv":        p_recv,
-            "total_packets":       p_sent + p_recv,
-            "errors_in":           errin,
-            "errors_out":          errout,
-            "drops_in":            dropin,
-            "bandwidth_kbps":      avg_bw,
-            "peak_kbps_up":        peak_up,
-            "peak_kbps_dn":        peak_dn,
-            "avg_pps":             avg_pps,
-            "protocols":           dict(self.protocol_counter),
-            "port_protocols":      dict(self.port_protocols),
-            "connection_states":   dict(self.connection_states),
-            "dc_connections":      self.dc_connections,
-            "unique_connections":  len(unique),
-            "new_connections":     list(set(all_new)),
-            "dropped_connections": list(set(all_dropped)),
-            "total_snapshots":     len(self.snapshots),
-            "bw_series":           series,
-            "events":              self.events,
-            "pcap_analysis":       pcap_analysis,
+            "duration":           elapsed,
+            "start_time":         self.start_time,
+            "bytes_sent":         b_sent,
+            "bytes_recv":         b_recv,
+            "total_bytes":        b_sent + b_recv,
+            "packets_sent":       p_sent,
+            "packets_recv":       p_recv,
+            "total_packets":      p_sent + p_recv,
+            "errors_in":          errin,
+            "errors_out":         errout,
+            "drops_in":           dropin,
+            "bandwidth_kbps":     avg_bw,
+            "peak_kbps_up":       peak_up,
+            "peak_kbps_dn":       peak_dn,
+            "avg_pps":            avg_pps,
+            "protocols":          dict(self.protocol_counter),
+            "port_protocols":     dict(self.port_protocols),
+            "connection_states":  dict(self.connection_states),
+            "dc_connections":     self.dc_connections,
+            "unique_connections": len(unique),
+            "new_connections":    list(set(all_new)),
+            "dropped_connections":list(set(all_dropped)),
+            "total_snapshots":    len(self.snapshots),
+            "bw_series":          series,
+            "events":             self.events,
         }
 
     def export_to_file(self, filename: str):
@@ -473,7 +422,7 @@ class NetworkCapture:
                 W("─" * 70 + "\n")
 
             W("═" * 70 + "\n")
-            W("  TG_NETWORK_capturer — FULL CAPTURE REPORT (IPv4 + IPv6)\n")
+            W("  TG_NETWORK_capturer — FULL CAPTURE REPORT\n")
             W(f"  Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             W("═" * 70 + "\n")
 
@@ -499,20 +448,20 @@ class NetworkCapture:
             W(f"  Drops In         : {r['drops_in']}\n")
 
             section("BANDWIDTH OVER TIME")
-            W(f"  {'Time(s)':>8}  {'↑ Kbps':>10}  {'↓ Kbps':>10}  {'↑ PPS':>7}  {'↓ PPS':>7}\n")
+            W(f"  {'Time(s)':>8}  {'\u2191 Kbps':>10}  {'\u2193 Kbps':>10}  {'\u2191 PPS':>7}  {'\u2193 PPS':>7}\n")
             W("  " + "-" * 50 + "\n")
             for s in r["bw_series"]:
                 W(f"  {s['time_offset']:>8.1f}  {s['kbps_up']:>10.2f}  {s['kbps_dn']:>10.2f}"
                   f"  {s['pps_up']:>7.1f}  {s['pps_dn']:>7.1f}\n")
 
-            section("TELEGRAM DATA CENTERS DETECTED (IPv4 + IPv6)")
+            section("TELEGRAM DATA CENTERS DETECTED")
             if r["dc_connections"]:
                 for ip, dc in r["dc_connections"].items():
                     proto = "IPv6" if ":" in ip else "IPv4"
                     W(f"  • [{proto}] {ip:40} → {dc}\n")
-                W("\n  [CCNA] Your voice call is routed to the above DC.\n")
-                W("  Traffic to these IPs uses MTProto inside TLS (port 443)\n")
-                W("  and UDP for real-time voice frames.\n")
+                W("\n  [CCNA] Voice call is routed to the above DC.\n")
+                W("  Traffic uses MTProto inside TLS (port 443)\n")
+                W("  and UDP 596/597/598/599 for real-time voice frames.\n")
             else:
                 W("  ⚠️  No Telegram DC IPs detected directly.\n")
                 W("  Possible causes: VPN, proxy, or NAT masking the real IP.\n")
@@ -523,11 +472,18 @@ class NetworkCapture:
                 pct = cnt / total * 100
                 bar = "█" * int(pct / 5)
                 W(f"  {proto:5}  {cnt:5} ({pct:5.1f}%)  {bar}\n")
+            W("\n  [CCNA] TCP  = connection-oriented, reliable, 3-way handshake\n")
+            W("         UDP  = connectionless, low latency, preferred for VoIP\n")
+            W("         Voice frames use UDP 596-599; signalling uses TCP/TLS.\n")
 
             section("APPLICATION LAYER PROTOCOLS (by port number)")
             top = sorted(r["port_protocols"].items(), key=lambda x: -x[1])[:15]
             for proto, cnt in top:
                 W(f"  • {proto:25} {cnt:5} occurrences\n")
+            W("\n  [CCNA] Port 443  = HTTPS/TLS (MTProto encrypted inside)\n")
+            W("         STUN 3478/1400 = NAT traversal for UDP voice\n")
+            W("         TG-Voice 596-599 = encrypted Telegram voice media\n")
+            W("         DNS  53  = hostname lookups\n")
 
             section("TCP CONNECTION STATES")
             for state, cnt in sorted(r["connection_states"].items(), key=lambda x: -x[1]):
@@ -554,53 +510,21 @@ class NetworkCapture:
                 offset = ev["timestamp"] - r["start_time"]
                 W(f"  {ts_s}  +{offset:>6.1f}s  {ev['event']:<25}  {ev['details']}\n")
 
-            section("SNAPSHOT DETAILS")
-            for i, snap in enumerate(self.snapshots, 1):
-                ts_s   = datetime.fromtimestamp(snap["timestamp"]).strftime("%H:%M:%S.%f")[:-3]
-                offset = snap["timestamp"] - self.start_time
-                W(f"\n  ─ Snapshot #{i:02d}  [{ts_s}]  +{offset:.1f}s  [{snap['event_type']}]\n")
-                W(f"    Active: {len(snap['connections'])}  "
-                  f"New: {len(snap.get('new_connections',[]))}  "
-                  f"Dropped: {len(snap.get('dropped_connections',[]))}\n")
-                for c in snap["connections"][:12]:
-                    tg  = " ◄ TG" if c["is_telegram"] else ""
-                    ver = c.get("ip_version", "")
-                    W(f"    [{c['protocol']:3}/{ver:4}] {c['local']:30} ↔ {c['remote']:40}"
-                      f"  {c['port_protocol']:15}  {c['status']}{tg}\n")
-                if len(snap["connections"]) > 12:
-                    W(f"    ... +{len(snap['connections'])-12} more connections\n")
-
-            section("UDP + STUN PACKET ANALYSIS (IPv4 + IPv6)")
-            pcap = r.get("pcap_analysis", {})
-            W("  STUN Packets (NAT traversal):\n")
-            for stun in pcap.get("stun_packets", []):
-                W(f"    [{stun.get('ip_version','?'):4}] "
-                  f"{stun['src_ip']}:{stun['src_port']} → "
-                  f"{stun['dst_ip']}:{stun['dst_port']}  "
-                  f"XOR‑IP: {stun['xored_ip']}\n")
-            if not pcap.get("stun_packets"):
-                W("    No STUN packets found.\n")
-            W("\n  UDP Conversations:\n")
-            W(pcap.get("udp_conversations", "N/A"))
-            W("\n  RTP Streams:\n")
-            W(pcap.get("rtp_streams", "N/A"))
-
             section("CCNA STUDY NOTES")
             notes = [
-                ("TCP",           "Layer 4 — connection-oriented, reliable delivery via sequence numbers"),
-                ("UDP",           "Layer 4 — connectionless, no retransmit (ideal for real-time voice)"),
-                ("MTProto",       "Layer 7 — Telegram's own encrypted protocol, tunnelled over TLS"),
-                ("TLS 1.3",       "Layer 4-7 — encrypts MTProto; you see the connection but not content"),
-                ("STUN",          "Layer 5-7 — NAT traversal: discovers external IP:port for UDP voice"),
-                ("IPv6 STUN",     "stun.att.ipv6.xord — XOR-MAPPED-ADDRESS for IPv6 participants"),
-                ("AF_INET6",      "Python socket family for IPv6; dest tuple = (ip, port, flowinfo, scope)"),
-                ("3-way HS",      "SYN → SYN-ACK → ACK: TCP connection setup"),
-                ("FIN handshake", "FIN → FIN-ACK → FIN → ACK: graceful TCP close"),
-                ("TIME_WAIT",     "TCP state after close: OS holds port 2×MSL to catch delayed packets"),
-                ("Ephemeral",     "Ports >49152: OS-assigned source ports for each new outbound connection"),
-                ("Bandwidth",     "Total bits/sec = (bytes_sent + bytes_recv) × 8 / elapsed_seconds"),
-                ("PPS",           "Packets/sec: spikes when mic is ON (50 pkts/s), drops when muted"),
-                ("DC IPs",        "Telegram routes via 5 DCs; now tracked for both IPv4 and IPv6"),
+                ("TCP",            "Layer 4 — connection-oriented, reliable delivery via sequence numbers"),
+                ("UDP",            "Layer 4 — connectionless, no retransmit (ideal for real-time voice)"),
+                ("MTProto",        "Layer 7 — Telegram's own encrypted protocol, tunnelled over TLS"),
+                ("TLS 1.3",        "Layer 4-7 — encrypts MTProto; connection visible, content not"),
+                ("STUN",           "Layer 5-7 — NAT traversal on port 3478 or 1400"),
+                ("TG Voice",       "UDP ports 596/597/598/599 — encrypted Telegram voice media"),
+                ("3-way HS",       "SYN → SYN-ACK → ACK: TCP connection setup"),
+                ("FIN handshake",  "FIN → FIN-ACK → FIN → ACK: graceful TCP close"),
+                ("TIME_WAIT",      "TCP state after close: OS holds port 2×MSL to catch delayed packets"),
+                ("Ephemeral",      "Ports >49152: OS-assigned source ports for outbound connections"),
+                ("Bandwidth",      "Total bits/sec = (bytes_sent + bytes_recv) × 8 / elapsed_seconds"),
+                ("PPS",            "Packets/sec: spikes when mic is ON, drops when muted"),
+                ("DC IPs",         "Telegram routes via 5 DCs; closest DC handles your voice call"),
             ]
             for term, note in notes:
                 W(f"  {term:15} — {note}\n")
@@ -610,7 +534,39 @@ class NetworkCapture:
             W("═" * 70 + "\n")
 
     def export_analysis_json(self, filename: str):
-        r            = self.get_report()
-        pcap_analysis = r.get("pcap_analysis", {})
+        """
+        Export the full capture report as a JSON file.
+        Suitable for programmatic consumption / further analysis.
+        """
+        r = self.get_report()
+        # Ensure the dict is JSON-serialisable (convert sets to lists etc.)
+        safe = {
+            "generated":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration":            r["duration"],
+            "start_time":          r["start_time"],
+            "bytes_sent":          r["bytes_sent"],
+            "bytes_recv":          r["bytes_recv"],
+            "total_bytes":         r["total_bytes"],
+            "packets_sent":        r["packets_sent"],
+            "packets_recv":        r["packets_recv"],
+            "total_packets":       r["total_packets"],
+            "errors_in":           r["errors_in"],
+            "errors_out":          r["errors_out"],
+            "drops_in":            r["drops_in"],
+            "bandwidth_kbps":      r["bandwidth_kbps"],
+            "peak_kbps_up":        r["peak_kbps_up"],
+            "peak_kbps_dn":        r["peak_kbps_dn"],
+            "avg_pps":             r["avg_pps"],
+            "protocols":           r["protocols"],
+            "port_protocols":      r["port_protocols"],
+            "connection_states":   r["connection_states"],
+            "dc_connections":      r["dc_connections"],
+            "unique_connections":  r["unique_connections"],
+            "new_connections":     list(r["new_connections"]),
+            "dropped_connections": list(r["dropped_connections"]),
+            "total_snapshots":     r["total_snapshots"],
+            "bw_series":           r["bw_series"],
+            "events":              r["events"],
+        }
         with open(filename, "w", encoding="utf-8") as f:
-            json.dump(pcap_analysis, f, indent=2)
+            json.dump(safe, f, indent=2, ensure_ascii=False)
