@@ -19,6 +19,7 @@ import json
 import time
 import psutil
 import subprocess
+import re
 import os
 import sys
 import platform
@@ -41,6 +42,9 @@ TELEGRAM_DCS: dict[str, str] = {
     "91.108.56.130":    "DC5 🇸🇬 Singapore",
     "91.108.56.149":    "DC5 🇸🇬 Singapore",
     "91.108.4.0":       "DC5 🇸🇬 Singapore (alt)",
+    # ── DC5 voice-relay IPs confirmed from live udp.txt capture ───────────────
+    "91.108.17.49":     "DC5 🇸🇬 Singapore (voice-relay)",
+    "91.108.17.50":     "DC5 🇸🇬 Singapore (voice-relay)",
     "91.105.192.0":     "TG-CDN 🌐 Media",
     "95.161.76.0":      "TG-CDN 🌐 Media",
     # ── IPv6 ──────────────────────────────────────────────────────────────────
@@ -54,7 +58,36 @@ TELEGRAM_DCS: dict[str, str] = {
     "2001:67c:4e8:f004::e":  "DC4 🇳🇱 Netherlands  [IPv6 alt]",
     "2001:b28:f23f:f005::a": "DC5 🇸🇬 Singapore   [IPv6]",
     "2001:b28:f23f:f005::e": "DC5 🇸🇬 Singapore   [IPv6 alt]",
+    # ── DC5 IPv6 voice-relay subnet confirmed from live udp.txt capture ───────
+    # Real relay: 2001:b28:f23f:f105:3:0:867:1  (part of /f105: subnet)
+    "2001:b28:f23f:f105:3:0:867:1": "DC5 🇸🇬 Singapore [IPv6 voice-relay]",
 }
+
+# ── IPv6 prefix list for DC5 voice-relay subnet (prefix matching) ─────────────
+# Telegram uses the 2001:b28:f23f:f105::/64 block for group-call relays.
+# Exact-match dict above covers the known relay; prefix list catches any new ones.
+TELEGRAM_IPV6_PREFIXES: list[tuple[str, str]] = [
+    ("2001:b28:f23d:f001:",  "DC1 🇺🇸 US-Virginia  [IPv6]"),
+    ("2001:67c:4e8:f002:",   "DC2 🇳🇱 Netherlands  [IPv6]"),
+    ("2001:b28:f23d:f003:",  "DC3 🇺🇸 US-Miami     [IPv6]"),
+    ("2001:67c:4e8:f004:",   "DC4 🇳🇱 Netherlands  [IPv6]"),
+    ("2001:b28:f23f:f005:",  "DC5 🇸🇬 Singapore   [IPv6]"),
+    ("2001:b28:f23f:f105:",  "DC5 🇸🇬 Singapore   [IPv6 voice-relay]"),  # ← real relay subnet
+]
+
+
+def lookup_dc(ip: str) -> str:
+    """Return DC label for an IP, using exact match first then prefix scan."""
+    if ip in TELEGRAM_DCS:
+        return TELEGRAM_DCS[ip]
+    # IPv6 prefix fallback
+    if ":" in ip:
+        ip_lower = ip.lower()
+        for prefix, label in TELEGRAM_IPV6_PREFIXES:
+            if ip_lower.startswith(prefix):
+                return label
+    return ""
+
 
 # ─── Well-known port → protocol name ─────────────────────────────────────────
 PORT_PROTOCOLS: dict[int, str] = {
@@ -108,6 +141,58 @@ def identify_port(port: int) -> str:
 def _strip_zone(ip: str) -> str:
     """Strip IPv6 zone ID suffix (e.g. fe80::1%eth0 → fe80::1)."""
     return ip.split("%")[0] if ip else ip
+
+
+# ─── STUN-based voice port detection ─────────────────────────────────────────
+
+def detect_voice_port_via_stun(iface: str, timeout: int = 15) -> tuple[str, int] | None:
+    """
+    Sniff live STUN packets for up to `timeout` seconds using tshark.
+    Reads XOR-MAPPED-ADDRESS from STUN Binding Responses to discover the
+    real UDP port Telegram's voice relay is using this session.
+
+    Returns (relay_ip, local_port) or None if not found.
+
+    Why this works:
+      Telegram group calls use ICE/STUN to negotiate a dynamic UDP port.
+      The STUN Binding Success Response contains XOR-MAPPED-ADDRESS which
+      tells your VPS its own public IP:port as seen by Telegram's relay.
+      e.g.  XOR-MAPPED-ADDRESS: 2001:b28:f23f:f105:3:0:867:1:32003
+            → relay_ip = 2001:b28:f23f:f105:3:0:867:1
+            → local_port = 32003   ← the real voice UDP port
+    """
+    try:
+        cmd = [
+            "tshark",
+            "-i", iface,
+            "-Y", "stun.att.type == 0x0020",        # XOR-MAPPED-ADDRESS attribute
+            "-T", "fields",
+            "-e", "ip.src",
+            "-e", "ipv6.src",
+            "-e", "stun.xor-mapped-address",
+            "-a", f"duration:{timeout}",
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            ipv4_src, ipv6_src, xma = parts[0], parts[1], parts[2]
+            relay_ip = ipv6_src.strip() or ipv4_src.strip()
+            # XOR-MAPPED-ADDRESS format: "IP:PORT"
+            m = re.search(r":(\d+)$", xma.strip())
+            if m:
+                port = int(m.group(1))
+                if 1024 <= port <= 65535:
+                    return (relay_ip, port)
+    except Exception:
+        pass
+    return None
 
 
 # ─── Packet Capture (cross‑platform) ─────────────────────────────────────────
@@ -222,7 +307,8 @@ class NetworkCapture:
                     continue
 
                 port_proto = identify_port(remote_pt)
-                is_tg      = remote_ip in TELEGRAM_DCS
+                dc_label   = lookup_dc(remote_ip)       # ← uses prefix-aware lookup
+                is_tg      = bool(dc_label)
                 ip_ver     = "IPv6" if ":" in remote_ip else "IPv4"
 
                 conn = {
@@ -235,7 +321,7 @@ class NetworkCapture:
                     "status":        status,
                     "port_protocol": port_proto,
                     "is_telegram":   is_tg,
-                    "dc_label":      TELEGRAM_DCS.get(remote_ip, ""),
+                    "dc_label":      dc_label,
                 }
                 result.append(conn)
 
@@ -244,7 +330,7 @@ class NetworkCapture:
                 self.port_protocols[port_proto] += 1
 
                 if is_tg:
-                    self.dc_connections[remote_ip] = TELEGRAM_DCS[remote_ip]
+                    self.dc_connections[remote_ip] = dc_label
 
             except Exception:
                 continue
@@ -448,7 +534,7 @@ class NetworkCapture:
             W(f"  Drops In         : {r['drops_in']}\n")
 
             section("BANDWIDTH OVER TIME")
-            W(f"  {'Time(s)':>8}  {'\u2191 Kbps':>10}  {'\u2193 Kbps':>10}  {'\u2191 PPS':>7}  {'\u2193 PPS':>7}\n")
+            W(f"  {'Time(s)':>8}  {'↑ Kbps':>10}  {'↓ Kbps':>10}  {'↑ PPS':>7}  {'↓ PPS':>7}\n")
             W("  " + "-" * 50 + "\n")
             for s in r["bw_series"]:
                 W(f"  {s['time_offset']:>8.1f}  {s['kbps_up']:>10.2f}  {s['kbps_dn']:>10.2f}"
@@ -461,7 +547,7 @@ class NetworkCapture:
                     W(f"  • [{proto}] {ip:40} → {dc}\n")
                 W("\n  [CCNA] Voice call is routed to the above DC.\n")
                 W("  Traffic uses MTProto inside TLS (port 443)\n")
-                W("  and UDP 596/597/598/599 for real-time voice frames.\n")
+                W("  and dynamic UDP port negotiated via STUN/ICE for real-time voice frames.\n")
             else:
                 W("  ⚠️  No Telegram DC IPs detected directly.\n")
                 W("  Possible causes: VPN, proxy, or NAT masking the real IP.\n")
@@ -474,7 +560,7 @@ class NetworkCapture:
                 W(f"  {proto:5}  {cnt:5} ({pct:5.1f}%)  {bar}\n")
             W("\n  [CCNA] TCP  = connection-oriented, reliable, 3-way handshake\n")
             W("         UDP  = connectionless, low latency, preferred for VoIP\n")
-            W("         Voice frames use UDP 596-599; signalling uses TCP/TLS.\n")
+            W("         Voice frames use dynamic UDP port (found via STUN/ICE).\n")
 
             section("APPLICATION LAYER PROTOCOLS (by port number)")
             top = sorted(r["port_protocols"].items(), key=lambda x: -x[1])[:15]
@@ -482,7 +568,7 @@ class NetworkCapture:
                 W(f"  • {proto:25} {cnt:5} occurrences\n")
             W("\n  [CCNA] Port 443  = HTTPS/TLS (MTProto encrypted inside)\n")
             W("         STUN 3478/1400 = NAT traversal for UDP voice\n")
-            W("         TG-Voice 596-599 = encrypted Telegram voice media\n")
+            W("         Dynamic UDP = voice port discovered per-session via STUN ICE\n")
             W("         DNS  53  = hostname lookups\n")
 
             section("TCP CONNECTION STATES")
@@ -517,14 +603,15 @@ class NetworkCapture:
                 ("MTProto",        "Layer 7 — Telegram's own encrypted protocol, tunnelled over TLS"),
                 ("TLS 1.3",        "Layer 4-7 — encrypts MTProto; connection visible, content not"),
                 ("STUN",           "Layer 5-7 — NAT traversal on port 3478 or 1400"),
-                ("TG Voice",       "UDP ports 596/597/598/599 — encrypted Telegram voice media"),
+                ("ICE",            "Interactive Connectivity Establishment — negotiates voice port via STUN"),
+                ("TG Voice",       "Dynamic UDP port per session — discovered via STUN XOR-MAPPED-ADDRESS"),
                 ("3-way HS",       "SYN → SYN-ACK → ACK: TCP connection setup"),
                 ("FIN handshake",  "FIN → FIN-ACK → FIN → ACK: graceful TCP close"),
                 ("TIME_WAIT",      "TCP state after close: OS holds port 2×MSL to catch delayed packets"),
                 ("Ephemeral",      "Ports >49152: OS-assigned source ports for outbound connections"),
                 ("Bandwidth",      "Total bits/sec = (bytes_sent + bytes_recv) × 8 / elapsed_seconds"),
                 ("PPS",            "Packets/sec: spikes when mic is ON, drops when muted"),
-                ("DC IPs",         "Telegram routes via 5 DCs; closest DC handles your voice call"),
+                ("DC IPs",         "Telegram routes via 5 DCs; voice relays use /f105: IPv6 subnet (DC5)"),
             ]
             for term, note in notes:
                 W(f"  {term:15} — {note}\n")
@@ -539,7 +626,6 @@ class NetworkCapture:
         Suitable for programmatic consumption / further analysis.
         """
         r = self.get_report()
-        # Ensure the dict is JSON-serialisable (convert sets to lists etc.)
         safe = {
             "generated":           datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "duration":            r["duration"],

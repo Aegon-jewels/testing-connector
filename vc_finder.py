@@ -10,7 +10,7 @@ CCNA concepts covered:
   ✅ Port-to-protocol mapping
   ✅ Bandwidth calculation (Kbps)
   ✅ Packets per second (PPS)
-  ✅ Telegram Data Center IP detection (IPv4 + IPv6)
+  ✅ Telegram Data Center IP detection (IPv4 + IPv6 + prefix matching)
   ✅ Connection delta tracking
   ✅ Peak bandwidth & average PPS
   ✅ Packet error and drop counters
@@ -19,6 +19,7 @@ CCNA concepts covered:
 import time
 import psutil
 import subprocess
+import re
 import os
 import sys
 import platform
@@ -41,6 +42,9 @@ TELEGRAM_DCS: dict[str, str] = {
     "91.108.56.130":    "DC5 🇸🇬 Singapore",
     "91.108.56.149":    "DC5 🇸🇬 Singapore",
     "91.108.4.0":       "DC5 🇸🇬 Singapore (alt)",
+    # ── DC5 voice-relay IPs confirmed from live udp.txt capture ───────────────
+    "91.108.17.49":     "DC5 🇸🇬 Singapore (voice-relay)",
+    "91.108.17.50":     "DC5 🇸🇬 Singapore (voice-relay)",
     "91.105.192.0":     "TG-CDN 🌐 Media",
     "95.161.76.0":      "TG-CDN 🌐 Media",
     # ── IPv6 ──────────────────────────────────────────────────────────────────
@@ -54,7 +58,33 @@ TELEGRAM_DCS: dict[str, str] = {
     "2001:67c:4e8:f004::e":  "DC4 🇳🇱 Netherlands  [IPv6 alt]",
     "2001:b28:f23f:f005::a": "DC5 🇸🇬 Singapore   [IPv6]",
     "2001:b28:f23f:f005::e": "DC5 🇸🇬 Singapore   [IPv6 alt]",
+    # ── DC5 IPv6 voice-relay subnet confirmed from live udp.txt capture ───────
+    "2001:b28:f23f:f105:3:0:867:1": "DC5 🇸🇬 Singapore [IPv6 voice-relay]",
 }
+
+# ── IPv6 prefix list for DC5 voice-relay subnet (prefix matching) ─────────────
+# Telegram group-call relays use 2001:b28:f23f:f105::/64 — catches all relay IPs.
+TELEGRAM_IPV6_PREFIXES: list[tuple[str, str]] = [
+    ("2001:b28:f23d:f001:",  "DC1 🇺🇸 US-Virginia  [IPv6]"),
+    ("2001:67c:4e8:f002:",   "DC2 🇳🇱 Netherlands  [IPv6]"),
+    ("2001:b28:f23d:f003:",  "DC3 🇺🇸 US-Miami     [IPv6]"),
+    ("2001:67c:4e8:f004:",   "DC4 🇳🇱 Netherlands  [IPv6]"),
+    ("2001:b28:f23f:f005:",  "DC5 🇸🇬 Singapore   [IPv6]"),
+    ("2001:b28:f23f:f105:",  "DC5 🇸🇬 Singapore   [IPv6 voice-relay]"),  # ← real relay
+]
+
+
+def lookup_dc(ip: str) -> str:
+    """Return DC label for an IP — exact match first, then IPv6 prefix scan."""
+    if ip in TELEGRAM_DCS:
+        return TELEGRAM_DCS[ip]
+    if ":" in ip:
+        ip_lower = ip.lower()
+        for prefix, label in TELEGRAM_IPV6_PREFIXES:
+            if ip_lower.startswith(prefix):
+                return label
+    return ""
+
 
 # ─── Well-known port → protocol name ─────────────────────────────────────────
 PORT_PROTOCOLS: dict[int, str] = {
@@ -66,6 +96,7 @@ PORT_PROTOCOLS: dict[int, str] = {
     853:   "DNS-over-TLS",
     3478:  "STUN",
     3479:  "STUN-Alt",
+    1400:  "STUN-Telegram",
     5349:  "TURNS",
     19302: "STUN-Google",
     5222:  "MTProto-Proxy",
@@ -104,6 +135,51 @@ def _strip_zone(ip: str) -> str:
     return ip.split("%")[0] if ip else ip
 
 
+# ─── STUN-based voice port detection ─────────────────────────────────────────
+
+def detect_voice_port_via_stun(iface: str, timeout: int = 15) -> tuple[str, int] | None:
+    """
+    Sniff live STUN packets for up to `timeout` seconds.
+    Returns (relay_ip, local_port) from the STUN XOR-MAPPED-ADDRESS.
+
+    How it works:
+      Telegram ICE negotiation → STUN Binding Response contains:
+        XOR-MAPPED-ADDRESS: <relay_ip>:<your_port>
+      e.g. from udp.txt line 4:
+        XOR-MAPPED-ADDRESS: 2001:b28:f23f:f105:3:0:867:1:32003
+        → relay_ip  = 2001:b28:f23f:f105:3:0:867:1  (DC5 Singapore)
+        → local_port = 32003  ← the real voice UDP port for this session
+    """
+    try:
+        cmd = [
+            "tshark",
+            "-i", iface,
+            "-Y", "stun.att.type == 0x0020",
+            "-T", "fields",
+            "-e", "ip.src",
+            "-e", "ipv6.src",
+            "-e", "stun.xor-mapped-address",
+            "-a", f"duration:{timeout}",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 5,
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            ipv4_src, ipv6_src, xma = parts[0], parts[1], parts[2]
+            relay_ip = ipv6_src.strip() or ipv4_src.strip()
+            m = re.search(r":(\d+)$", xma.strip())
+            if m:
+                port = int(m.group(1))
+                if 1024 <= port <= 65535:
+                    return (relay_ip, port)
+    except Exception:
+        pass
+    return None
+
+
 # ─── Packet Capture (cross‑platform) ─────────────────────────────────────────
 
 class PacketCapture:
@@ -123,7 +199,6 @@ class PacketCapture:
                       "-f", "udp", "-w", self.output_file, "-F", "pcapng"]
             kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
         else:
-            # Capture both IPv4 and IPv6 UDP
             cmd    = ["sudo", "tcpdump", "-i", self._find_interface(),
                       "-U", "-w", self.output_file, "-s", "0",
                       "udp or (ip6 and udp)"]
@@ -185,7 +260,6 @@ class NetworkCapture:
     def _read_connections(self) -> list[dict]:
         result = []
         try:
-            # kind='all' → captures IPv4 TCP/UDP AND IPv6 TCP/UDP
             conns = psutil.net_connections(kind="all")
         except Exception:
             return result
@@ -203,7 +277,8 @@ class NetworkCapture:
                     continue
 
                 port_proto = identify_port(remote_pt)
-                is_tg      = remote_ip in TELEGRAM_DCS
+                dc_label   = lookup_dc(remote_ip)      # ← prefix-aware lookup
+                is_tg      = bool(dc_label)
                 ip_ver     = "IPv6" if ":" in remote_ip else "IPv4"
 
                 conn = {
@@ -216,7 +291,7 @@ class NetworkCapture:
                     "status":        status,
                     "port_protocol": port_proto,
                     "is_telegram":   is_tg,
-                    "dc_label":      TELEGRAM_DCS.get(remote_ip, ""),
+                    "dc_label":      dc_label,
                 }
                 result.append(conn)
 
@@ -225,7 +300,7 @@ class NetworkCapture:
                 self.port_protocols[port_proto] += 1
 
                 if is_tg:
-                    self.dc_connections[remote_ip] = TELEGRAM_DCS[remote_ip]
+                    self.dc_connections[remote_ip] = dc_label
 
             except Exception:
                 continue
@@ -420,6 +495,7 @@ class NetworkCapture:
                     W(f"  • [{proto}] {ip:40} → {dc}\n")
             else:
                 W("  ⚠️  No Telegram DC IPs detected.\n")
+                W("  Tip: voice relay uses 2001:b28:f23f:f105:: (DC5 Singapore IPv6)\n")
 
             section("TRANSPORT PROTOCOL DISTRIBUTION")
             total = sum(r["protocols"].values()) or 1
